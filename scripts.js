@@ -61,10 +61,19 @@ MongoClient.connect(url, function(err, client) {
       }
     }
 
+    function timeoutPromised(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function sleep(time) {
+      await timeoutPromised(time);
+    }
+
     async function asyncWhile(callback) {
       let iterateAgain = true
       while (iterateAgain == true) {
         iterateAgain = await callback();
+        await sleep(binance.rateLimit);
       }
     }
 
@@ -136,3 +145,4 @@ MongoClient.connect(url, function(err, client) {
   })()
 
 });
+
