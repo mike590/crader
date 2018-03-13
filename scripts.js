@@ -8,6 +8,7 @@ const dbName = 'crader';
 
 let binance = new ccxt.binance ({ verbose: false });
 
+// ms conversions
 const minuteInMilliseconds = 1000 * 60;
 const hourInMilliseconds = minuteInMilliseconds * 60;
 const dayInMilliseconds = hourInMilliseconds * 24;
@@ -30,7 +31,8 @@ const intervals = {'1m': minuteInMilliseconds};
 //                     '1w': dayInMilliseconds * 7,
 //                     '1M': dayInMilliseconds * 31
 //                   };
-
+// ----------------------
+// async helpers
 async function asyncForEach(array, callback) {
   for (let index = 0; index < array.length; index++) {
     await callback(array[index], index, array)
@@ -52,7 +54,7 @@ async function asyncWhile(callback) {
     await sleep(binance.rateLimit);
   }
 }
-
+// -----------------------------
 // Use connect method to connect to the server
 MongoClient.connect(url, function(err, client) {
   console.log("Connected successfully to server");
@@ -70,12 +72,17 @@ MongoClient.connect(url, function(err, client) {
       if (oldestRec) {
        ohlcv = await binance.fetchOHLCV ('ETH/USDT', int, oldestRec + intervals['1m']);
       } else {
-       ohlcv = await binance.fetchOHLCV ('ETH/USDT', int, Date.now()-(intervals['1m']*20));
+       ohlcv = await binance.fetchOHLCV ('ETH/USDT', int, Date.now()-(intervals['1m']*9));
       }
       await asyncForEach(ohlcv, async (rec) => {
         let typical = (rec[2] + rec[3] + rec[4]) / 3;
         // Repeat for the rest of the indicators
-        let {ma: tempMa, ema: tempEma} = await setIndicators(rec, int);
+        let {
+          ma: tempMa,
+          ema: tempEma,
+          agl: tempAgl,
+          rsi: tempRsi
+        } = await setIndicators(rec, int);
         await db.collection('pair_record').insertOne({
           'base': 'ETH',
           'quote': 'USDT',
@@ -88,7 +95,9 @@ MongoClient.connect(url, function(err, client) {
           'typical': typical,
           'volume': rec[5],
           'ma': tempMa,
-          'ema': tempEma
+          'ema': tempEma,
+          'agl': tempAgl,
+          'rsi': tempRsi
         });
       });
       if (ohlcv.length === 500) {
@@ -108,39 +117,119 @@ MongoClient.connect(url, function(err, client) {
       const spanStart = rec[0] - (intervals[interval] * (span - 1) + (intervals[interval] * 0.2)) ;
       const typical = (rec[2] + rec[3] + rec[4]) / 3;
       let docs = await db.collection('pair_record').find({'time': {'$gt': spanStart}, 'interval': interval}).sort({'time': -1}).toArray();
+      // taking indicators based on typical price ((low + high + close)/3) and closing price
+      let aglt = agl(docs, typical, 'typical');
+      let aglc = agl(docs, rec[4], 'close');
       return {
-        'ma': ma(docs, typical),
-        'ema': ema(docs[0], typical)
+        'ma': {
+          'typical': ma(docs, typical, 'typical'),
+          'close': ma(docs, rec[4], 'close')
+        },
+        'ema': {
+          'typical': ema(docs[0], typical, 'typical'),
+          'close': ema(docs[0], rec[4], 'close')
+        },
+        // average gain/loss ([gain, loss]) typical
+        'agl': {
+          'typical': aglt,
+          'close': aglc
+        },
+        'rsi': {
+          'typical': rsi(aglt),
+          'close': rsi(aglc)
+        }
       };
     }
 
-    function ma(docs, typical) {
+    function ma(docs, currentPrice, key) {
       let tempMa = {};
       [4, 9, 24, 44, 69, 89].forEach(endIndex => {
         let subArray = docs.slice(0, endIndex);
-        let reduction = subArray.reduce((a, cV) => {return a + cV.typical}, 0)
-        tempMa[endIndex + 1] = (reduction + typical) / (subArray.length + 1);
+        let reduction = subArray.reduce((a, cV) => {return a + cV[key]}, 0);
+        tempMa[endIndex + 1] = (reduction + currentPrice) / (subArray.length + 1);
       });
       return tempMa;
     }
 
-    function ema(previousDoc, typical) {
+    function ema(previousDoc, currentPrice, key) {
       if (previousDoc) {
         let tempEma = {};
         [6, 12, 26, 40].forEach(period => {
           let multiplier = 2 / (period + 1);
-          let previousEma = previousDoc['ema'][period];
-          tempEma[period] = (typical - previousEma) * multiplier + previousEma;
+          let previousEma = previousDoc['ema'][key][period];
+          tempEma[period] = (currentPrice - previousEma) * multiplier + previousEma;
         });
         return tempEma;
       } else {
         return {
-          6: typical,
-          12: typical,
-          26: typical,
-          40: typical
+          6: currentPrice,
+          12: currentPrice,
+          26: currentPrice,
+          40: currentPrice
         };
       }
+    }
+
+    function agl(docs, currentPrice, key) {
+      let agl = {};
+      [6, 13, 20, 27, 34].forEach(endIndex => {
+        // calculate based on smoothing formula
+        if (docs[0] && docs[0].agl[key] && docs[0].agl[key][endIndex + 1]) {
+          let gain, loss;
+          if (currentPrice > docs[0][key]) {
+            loss = ((docs[0].agl[key][endIndex + 1][1] * endIndex) / (endIndex + 1));
+            gain = (((docs[0].agl[key][endIndex + 1][0] * endIndex) + (currentPrice - docs[0][key])) / (endIndex + 1));
+          } else {
+            gain = ((docs[0].agl[key][endIndex + 1][0] * endIndex) / (endIndex + 1));
+            loss = (((docs[0].agl[key][endIndex + 1][1] * endIndex) + (docs[0][key] - currentPrice)) / (endIndex + 1));
+          }
+          agl[endIndex + 1] = [gain, loss];
+        // calculate by adding up the previous period
+        } else if (docs.length >= (endIndex)){
+          let lastPrice;
+          let gains = 0;
+          let losses = 0;
+          // reverse array to get oldest records first
+          let subArray = docs.slice(0, endIndex).reverse();
+          // calculate gains/losses of past records in this period
+          subArray.forEach(doc => {
+            if (lastPrice) {
+              if (lastPrice > doc[key]) {
+                losses += lastPrice - doc[key];
+              } else {
+                gains += doc[key] - lastPrice;
+              }
+            }
+            lastPrice = doc[key];
+          });
+          // current record is also in this period
+          if (lastPrice > currentPrice) {
+            losses += lastPrice - currentPrice;
+          } else {
+            gains += currentPrice - lastPrice;
+          }
+          const ag = gains / (endIndex + 1);
+          const al = losses / (endIndex + 1);
+          agl[endIndex + 1] = [ag, al];
+        // not enough to data to calculate
+        } else {
+          agl[endIndex + 1] = null;
+        }
+      });
+      return agl;
+    }
+
+    function rsi(agl) {
+      let tempRsi = {};
+      Object.keys(agl).forEach(i => {
+        if (agl[i]) {
+          let tempRs = agl[i][0] / agl[i][1];
+          tempRsi[i] = 100 - (100 / (1 + tempRs));
+        } else {
+          tempRsi[i] = null;
+        }
+      });
+      return tempRsi;
     }
 
     await asyncForEach(Object.keys(intervals), async (tempInt) => {
@@ -158,4 +247,3 @@ MongoClient.connect(url, function(err, client) {
   })()
 
 });
-
