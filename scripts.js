@@ -137,6 +137,10 @@ MongoClient.connect(url, function(err, client) {
         'rsi': {
           'typical': rsi(aglt),
           'close': rsi(aglc)
+        },
+        'momentum': {
+          'typical': momentum(docs, typical, 'typical'),
+          'close': momentum(docs, rec[4], 'close')
         }
       };
     }
@@ -230,6 +234,14 @@ MongoClient.connect(url, function(err, client) {
         }
       });
       return tempRsi;
+    }
+
+    function momentum(docs, currentPrice, key) {
+      let tempMomentum = {};
+      [4, 9, 24, 44, 69, 89].forEach(endIndex => {
+        tempMomentum[endIndex + 1] = currentPrice - docs[endIndex][key];
+      });
+      return tempMomentum;
     }
 
     await asyncForEach(Object.keys(intervals), async (tempInt) => {
